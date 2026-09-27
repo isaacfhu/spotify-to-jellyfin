@@ -6,7 +6,7 @@ Download Spotify playlists (audio + metadata) into a Jellyfin-ready music librar
 
 ## What you get
 
-- A `library/` folder organized as `Artist/Album/Track.mp3`, tagged with title, artist, album, track number, and embedded album art — everything Jellyfin needs to scan it properly.
+- A `library/` folder organized as `Artist/Album/Track.mp3`, tagged with title, artist, album, track number, and embedded album art and everything Jellyfin needs to scan it properly.
 - A `playlists/` folder with one subfolder + `.m3u` file per Spotify playlist, which Jellyfin picks up automatically as real playlists.
 - Three shell commands: one-off download, download-with-sync-tracking, and update-all-synced.
 
@@ -57,69 +57,117 @@ If it shows `--m3u [M3U]` with placeholder syntax like `{list[0]}`, you're set �
 
 ## Install the shortcuts
 
+These commands support **multiple music libraries** (e.g. one per family member, or "instrumental" vs "podcasts", etc.) through a short key you choose for each one — `i`, `p`, or anything you like. Add or remove libraries anytime by editing the `JF_ROOTS` array; the commands themselves never need to change.
+
 Append this to `~/.bashrc`, then `source ~/.bashrc`:
 
 ```bash
 # ── Jellyfin / spotDL config ─────────────────────────────
-JF_ROOT="$HOME/path/to/your/music/root"   # <-- change this
-JF_LIB="$JF_ROOT/library"
-JF_PL="$JF_ROOT/playlists"
-JF_SYNC="$JF_ROOT/.sync"
+declare -A JF_ROOTS=(
+  [i]="$HOME/path/to/your/first/music/root"    # <-- change this
+  [p]="$HOME/path/to/your/second/music/root"   # <-- change this
+  # [x]="$HOME/path/to/another/music/root"     # <-- add more like this
+)
+
 JELLYFIN_URL="http://localhost:8096"
 JELLYFIN_API_KEY="PASTE_YOUR_KEY_HERE"    # <-- change this
 
-_JF_OUT="$JF_LIB/{artist}/{album}/{track-number} - {title}.{output-ext}"
-_JF_M3U="playlists/{list[0]}/{list[0]}.m3u"   # relative — must run from $JF_ROOT
+_jf_root() {
+  local key="$1"
+  if [ -z "${JF_ROOTS[$key]}" ]; then
+    echo "Unknown library key '$key'. Available: ${!JF_ROOTS[@]}" >&2
+    return 1
+  fi
+  echo "${JF_ROOTS[$key]}"
+}
 
 _jf_scan() {
   [ -n "$JELLYFIN_API_KEY" ] && curl -s -X POST \
     "$JELLYFIN_URL/Library/Refresh" -H "X-Emby-Token: $JELLYFIN_API_KEY" >/dev/null
 }
 
-# One-off download of a playlist/album — no future updates tracked
+jf-list() {
+  echo "Configured libraries:"
+  for k in "${!JF_ROOTS[@]}"; do echo "  $k → ${JF_ROOTS[$k]}"; done
+}
+
+# One-off download — no future updates tracked
 jf-dl() {
-  [ -z "$1" ] && { echo "Usage: jf-dl <spotify-url>"; return 1; }
-  ( cd "$JF_ROOT" && spotdl download "$1" --output "$_JF_OUT" --m3u "$_JF_M3U" )
+  local key="$1" url="$2"
+  [ -z "$url" ] && { echo "Usage: jf-dl <key> <spotify-url>"; return 1; }
+  local root; root=$(_jf_root "$key") || return 1
+  local lib="$root/library"
+  ( cd "$root" && spotdl download "$url" \
+      --output "$lib/{artist}/{album}/{track-number} - {title}.{output-ext}" \
+      --m3u "playlists/{list[0]}/{list[0]}.m3u" )
   _jf_scan
 }
 
-# Download AND set it up to be kept in sync later
+# Download AND track it for future syncing
 jf-dl-sync() {
-  [ -z "$2" ] && { echo "Usage: jf-dl-sync <spotify-url> <short-name>"; return 1; }
-  mkdir -p "$JF_SYNC"
-  ( cd "$JF_ROOT" && spotdl sync "$1" --save-file "$JF_SYNC/$2.spotdl" --output "$_JF_OUT" --m3u "$_JF_M3U" )
+  local key="$1" url="$2" name="$3"
+  [ -z "$name" ] && { echo "Usage: jf-dl-sync <key> <spotify-url> <short-name>"; return 1; }
+  local root; root=$(_jf_root "$key") || return 1
+  local lib="$root/library" sync="$root/.sync"
+  mkdir -p "$sync"
+  ( cd "$root" && spotdl sync "$url" --save-file "$sync/$name.spotdl" \
+      --output "$lib/{artist}/{album}/{track-number} - {title}.{output-ext}" \
+      --m3u "playlists/{list[0]}/{list[0]}.m3u" )
   _jf_scan
 }
 
-# Update every playlist that's being synced
+# Update synced playlists — one library (key given) or all of them (no key)
 jf-update-synced() {
+  local key="$1"
+  local keys=()
+  if [ -n "$key" ]; then
+    _jf_root "$key" >/dev/null || return 1
+    keys=("$key")
+  else
+    keys=("${!JF_ROOTS[@]}")
+  fi
+
   shopt -s nullglob
-  for f in "$JF_SYNC"/*.spotdl; do
-    echo "→ Updating $(basename "$f" .spotdl)"
-    ( cd "$JF_ROOT" && spotdl sync "$f" --output "$_JF_OUT" --m3u "$_JF_M3U" )
+  for k in "${keys[@]}"; do
+    local root="${JF_ROOTS[$k]}"
+    local lib="$root/library" sync="$root/.sync"
+    for f in "$sync"/*.spotdl; do
+      echo "→ [$k] Updating $(basename "$f" .spotdl)"
+      ( cd "$root" && spotdl sync "$f" \
+          --output "$lib/{artist}/{album}/{track-number} - {title}.{output-ext}" \
+          --m3u "playlists/{list[0]}/{list[0]}.m3u" )
+    done
   done
   _jf_scan
 }
 ```
 
 **Before using it:**
-- Set `JF_ROOT` to your actual music root folder (quote it if the path has spaces).
+- Fill in `JF_ROOTS` with your real music root folders, keyed by whatever short letters/words you like (quote paths that contain spaces).
 - Set `JELLYFIN_API_KEY`, or leave it blank if you'd rather trigger library scans manually.
+- Each root needs its own pair of Jellyfin libraries set up as described above (one **Music** library at `<root>/library`, one **Playlists** library at `<root>/playlists`).
 
 ## Usage
 
+Every command now takes the library key as its **first** argument:
+
 ```bash
+jf-list                                                        # see configured library keys
+
 # One-time download, not tracked for future updates
-jf-dl "https://open.spotify.com/playlist/XXXXXXXXXXXX"
+jf-dl i "https://open.spotify.com/playlist/XXXXXXXXXXXX"
 
 # Download and track it for future syncing (pick any short name, no spaces)
-jf-dl-sync "https://open.spotify.com/playlist/XXXXXXXXXXXX" roadtrip
+jf-dl-sync p "https://open.spotify.com/playlist/XXXXXXXXXXXX" roadtrip
 
-# Later, refresh every playlist you've set up with jf-dl-sync
+# Refresh every synced playlist across ALL libraries
 jf-update-synced
+
+# Refresh only one library's synced playlists
+jf-update-synced p
 ```
 
-`jf-update-synced` is a good candidate for a cron job if you want playlists to stay current automatically:
+`jf-update-synced` (with no key, to cover every library) is a good candidate for a cron job if you want playlists to stay current automatically:
 
 ```bash
 # crontab -e — runs every day at 4am
@@ -134,14 +182,16 @@ Your spotDL version likely handles `--m3u` differently than assumed here. Check:
 spotdl sync --help | grep -A6 "\-\-m3u"
 ```
 - If it takes a template (`--m3u [M3U]` with placeholder syntax like `{list[0]}` or `{list-name}`), match the placeholder name shown in your help output.
-- If it's a bare switch with no argument, it writes to your *current directory* using the playlist's own name — the `( cd "$JF_ROOT" && ... )` wrapper already handles this correctly since the working directory is set before the call; just change `_JF_M3U="playlists/{list[0]}/{list[0]}.m3u"` to `_JF_M3U=""` and call `--m3u` with no value.
+- If it's a bare switch with no argument, it writes to your *current directory* using the playlist's own name — the `( cd "$root" && ... )` wrapper already handles this correctly since the working directory is set before the call; just drop the `--m3u "playlists/{list[0]}/{list[0]}.m3u"` argument to a bare `--m3u`.
 
-**Paths with spaces:** always keep `JF_ROOT` (and anything built from it) double-quoted. If you edit the functions, don't remove the quotes around `"$JF_ROOT"`, `"$_JF_OUT"`, etc.
+**Paths with spaces:** always keep every path variable (`$root`, `$lib`, `$sync`, and the entries inside `JF_ROOTS`) double-quoted. Don't remove the quotes when editing the functions.
 
-**Nothing shows up under Jellyfin → Playlists:** confirm you created a *separate* Jellyfin library with content type **Playlists** pointing at `<JF_ROOT>/playlists` — it won't show up if it's just a subfolder inside your Music library.
+**Unknown library key error:** run `jf-list` to see exactly which keys are configured — it must match a key in `JF_ROOTS` exactly (case-sensitive).
+
+**Nothing shows up under Jellyfin → Playlists:** confirm you created a *separate* Jellyfin library with content type **Playlists** pointing at `<that library's root>/playlists` — it won't show up if it's just a subfolder inside the Music library.
 
 **No artist photos:** these come from TheAudioDB/Fanart.tv plugins, not from Spotify or spotDL. Install and configure those plugins with free API keys in Jellyfin.
 
 ## Disclaimer
 
-This tooling relies on spotDL, which sources audio from YouTube rather than Spotify directly. You're responsible for how you use it. Only download content you have the right to.
+This tooling relies on spotDL, which sources audio from YouTube rather than Spotify directly. You're responsible for how you use it — only download content you have the right to.
